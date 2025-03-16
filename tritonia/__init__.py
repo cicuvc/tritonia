@@ -148,6 +148,8 @@ class InterpreterHelpers:
     
     @staticmethod
     def expand_args(args: list):
+        if not (args, '__iter__'):
+            args = [args]
         return [InterpreterHelpers.remove_const(i, allow_ast=False, throw=False) for i in args]
     @staticmethod
     def expand_kwargs(args: dict):
@@ -155,7 +157,7 @@ class InterpreterHelpers:
 
 
 class SemiInterpretedAstTransformer:
-    def __init__(self, ast_func: ast.FunctionDef, determined_args: dict[str, Any]):
+    def __init__(self, ast_func: ast.FunctionDef):
         self.ast_func = ast_func
         self.cached_vars: dict[ast.stmt, str] = dict()
         self.dependency_set: dict[PrimaryStatement, List[ast.stmt]] = dict()
@@ -164,9 +166,8 @@ class SemiInterpretedAstTransformer:
         self.name_scope.update({
             k: getattr(builtins, k) for k in dir(builtins)
         })
-        self.determined_args = determined_args
-
-        self.no_eval_funcs = {tl.arange, tl.load, tl.store}
+        
+        self.no_eval_funcs = {tl.arange, tl.load, tl.store, tl.program_id}
 
         self.expr_eval_funcs: dict[ast.stmt, Callable[[ast.stmt, ExtraScope, PrimaryStatement], Union[PseudoTensorValue, EvaluatedValue]]] = {
             ast.Call: self.eval_call,
@@ -193,6 +194,16 @@ class SemiInterpretedAstTransformer:
 
     def eval_any(self, ast_node: ast.stmt, extra_scope: ExtraScope, primary: PrimaryStatement) -> Union[PseudoTensorValue, EvaluatedValue]:
         return self.expr_eval_funcs[type(ast_node)](ast_node, extra_scope, primary)
+    
+    def eval_arg(self, ast_node: ast.arg) -> Tuple[str, bool]:
+        name = ast_node.arg
+        is_constexpr = False
+        if ast_node.annotation is not None:
+            annotation = self.eval_any(ast_node.annotation, dict(), ast_node)
+            is_constexpr = annotation.value == tl.constexpr
+        return (name, is_constexpr)
+
+
     def eval_tuple(self, ast_tuple: ast.Tuple, extra_scope: ExtraScope, primary: PrimaryStatement) -> Union[PseudoTensorValue, EvaluatedValue]:
         values = [self.eval_any(i, extra_scope, primary) for i in ast_tuple.elts]
         if all([InterpreterHelpers.is_evalueted_const(i) for i in values]):
@@ -212,8 +223,8 @@ class SemiInterpretedAstTransformer:
     def traverse_node(self, ast_node: ast.AST):
         pass
     
-    def process_expr(self, ast_expr: ast.Expr) -> List[ast.stmt]:
-        value = self.eval_any(ast_expr.value, dict(), ast_expr)
+    def process_expr(self, ast_expr: ast.Expr, extra_scope: ExtraScope) -> List[ast.stmt]:
+        value = self.eval_any(ast_expr.value, extra_scope, ast_expr)
 
         result = []
         if ast_expr in self.dependency_set:
@@ -223,17 +234,20 @@ class SemiInterpretedAstTransformer:
 
         return result
     
-    def process_func(self, ast_node: ast.FunctionDef):
+    def process_func(self, ast_node: ast.FunctionDef, extra_vars: dict[str, Any]):
+        extra_scope = {
+            k: EvaluatedValue(v) for (k,v) in extra_vars.items()
+        }
         new_body = []
         for i in self.ast_func.body:
             if type(i) == ast.Call:
                 self.process_call(i)
             elif type(i) == ast.Assign:
-                new_body.extend(self.process_assign(i, dict()))
+                new_body.extend(self.process_assign(i, extra_scope))
             elif type(i) == ast.Expr:
-                new_body.extend(self.process_expr(i))
+                new_body.extend(self.process_expr(i, extra_scope))
             elif type(i) == ast.AugAssign:
-                new_body.extend(self.process_aug_assign(i, dict()))
+                new_body.extend(self.process_aug_assign(i, extra_scope))
             else:
                 raise NotImplementedError()
             
@@ -411,26 +425,54 @@ class CodeWriter(ast._Unparser):
                 super().set_precedence(precedence, *nodes)
 
 
-def ijit(fn):
-    astx = ast.parse(inspect.getsource(fn))
-    print(ast.dump(astx, indent=4))
-    tf = SemiInterpretedAstTransformer(astx.body[0], {})
-    new_ast = tf.process_func(tf.ast_func)
-    unparser = CodeWriter()
-    source: str = unparser.visit(new_ast)
-    parse_globals = dict(globals())
-    parse_locals = dict()
-    parse_globals.update({
-        k: getattr(builtins, k) for k in dir(builtins)
-    })
-    origin_findsource = inspect.findsource
-    def new_findsource(obj) -> Tuple[List[str], int]:
-        if isinstance(obj, type(new_findsource)):
-            return ([i + '\n' for i in source.split('\n')], 1)
-        else:
-            return origin_findsource(obj)
-    inspect.findsource = new_findsource
-    exec(source, parse_globals, parse_locals)
-    inspect.findsource = origin_findsource
-    return parse_locals[tf.func_name]
-        
+
+class IntJitFunction[T]:
+    def __init__(self, fn: T):
+        self.fn = fn
+        self.fn_ast = ast.parse(inspect.getsource(fn))
+        self.fn_def: ast.FunctionDef = self.fn_ast.body[0]
+        self.tf = SemiInterpretedAstTransformer(self.fn_def)
+
+        self.argument_annotations = [self.tf.eval_arg(i) for i in self.fn_def.args.args]
+
+        pass
+
+    def __getitem__(self, grid: Tuple) -> T:
+        return IntCallableFunction(self, grid)
+    
+    def call_function(self, grid: Tuple, args: list, kwargs: dict):
+        extra_values = dict()
+        for idx, i in enumerate(self.argument_annotations):
+            if i[1]: # constexpr
+                extra_values[i[0]] = args[idx] if idx < len(args) else kwargs[i[0]]
+            
+        new_ast = self.tf.process_func(self.fn_def, extra_values)
+
+        unparser = CodeWriter()
+        source: str = unparser.visit(new_ast)
+
+        print(source)
+        parse_globals = dict(globals())
+        parse_locals = dict()
+        parse_globals.update({
+            k: getattr(builtins, k) for k in dir(builtins)
+        })
+        origin_findsource = inspect.findsource
+        def new_findsource(obj) -> Tuple[List[str], int]:
+            if isinstance(obj, type(new_findsource)):
+                return ([i + '\n' for i in source.split('\n')], 1)
+            else:
+                return origin_findsource(obj)
+        inspect.findsource = new_findsource
+        exec(source, parse_globals, parse_locals)
+
+        func_val = parse_locals[self.tf.func_name]
+        func_val[grid](*args, **kwargs)
+
+class IntCallableFunction:
+    def __init__(self, jit_fn: IntJitFunction, grid: Tuple):
+        self.jit_fn = jit_fn
+        self.grid = grid
+    
+    def __call__(self, *args, **kwargs):
+        self.jit_fn.call_function(self.grid, args, kwargs)
