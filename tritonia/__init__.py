@@ -29,7 +29,7 @@ class IdentifierRefValue:
         super().__init__()
         self.ast_node = ast_node
 
-class PseudoTensorValue(IdentifierRefValue):
+class PseudoTensorValue(IdentifierRefValue, np.generic):
     def __init__(self, ast_node: Union[ast.Name, ast.expr]):
         super().__init__(ast_node)
 
@@ -156,6 +156,10 @@ class InterpreterHelpers:
         return {k: InterpreterHelpers.remove_const(v, allow_ast=False, throw=False) for (k,v) in args.items()}
 
 
+tl_abs_ast = ast.Attribute(ast.Name('tl', ast.Load()), 'abs', ast.Load())
+tl_sqrt_ast = ast.Attribute(ast.Name('tl', ast.Load()), 'sqrt', ast.Load())
+
+
 class SemiInterpretedAstTransformer:
     def __init__(self, ast_func: ast.FunctionDef):
         self.ast_func = ast_func
@@ -168,6 +172,10 @@ class SemiInterpretedAstTransformer:
         })
         
         self.no_eval_funcs = {tl.arange, tl.load, tl.store, tl.program_id}
+        self.redirect_funcs = {
+            np.abs: np.frompyfunc(self.ufunc_abs, nin = 1, nout = 1),
+            np.sqrt: np.frompyfunc(self.ufunc_sqrt, nin = 1, nout = 1)
+        }
 
         self.expr_eval_funcs: dict[ast.stmt, Callable[[ast.stmt, ExtraScope, PrimaryStatement], Union[PseudoTensorValue, EvaluatedValue]]] = {
             ast.Call: self.eval_call,
@@ -182,6 +190,14 @@ class SemiInterpretedAstTransformer:
             ast.Subscript: self.eval_subscr
         }
         self.func_name = ast_func.name
+        self.current_primary = []
+
+    def ufunc_abs(self, x: PseudoTensorValue):
+        new_ast = ast.Call(tl_abs_ast, [x.ast_node], keywords=[], lineno=0)
+        return PseudoTensorValue(self.allocate_cache(new_ast, self.current_primary[-1]))
+    def ufunc_sqrt(self, x: PseudoTensorValue):
+        new_ast = ast.Call(tl_sqrt_ast, [x.ast_node], keywords=[], lineno=0)
+        return PseudoTensorValue(self.allocate_cache(new_ast, self.current_primary[-1]))
 
     def allocate_cache(self, x: ast.stmt, primary: PrimaryStatement) -> ast.Name:
         identifier = f"local_{len(self.cached_vars)}"
@@ -255,9 +271,13 @@ class SemiInterpretedAstTransformer:
         return ast.FunctionDef(ast_node.name, ast_node.args, new_body, [jit_decorator], lineno=0)
             
     def process_call(self, ast_call: ast.Call) -> None:
+        self.current_primary.append(ast_call)
         self.eval_call(ast_call, dict(), ast_call)
+        self.current_primary.pop()
         
     def process_assign(self, ast_assign: ast.Assign, extra_scope: ExtraScope) -> list[ast.stmt]:
+        self.current_primary.append(ast_assign)
+
         store_targets = [self.eval_store_name(i) for i in ast_assign.targets]
         if len(store_targets) > 1:
             raise NotImplementedError()
@@ -275,9 +295,12 @@ class SemiInterpretedAstTransformer:
         if isinstance(rhs, ast.AST):
             result.append(ast.Assign(ast_assign.targets, rhs, lineno=0))
 
+        self.current_primary.pop()
         return result
     
     def process_aug_assign(self, ast_assign: ast.AugAssign, extra_scope: ExtraScope) -> list[ast.stmt]:
+        self.current_primary.append(ast_assign)
+
         store_targets = self.eval_store_name(ast_assign.target)
         lhs = self.eval_any(ast_assign.target, extra_scope, ast_assign)
         rhs = self.eval_any(ast_assign.value, extra_scope, ast_assign)
@@ -296,6 +319,7 @@ class SemiInterpretedAstTransformer:
         if isinstance(rhs, ast.AST):
             result.append(ast.AugAssign(ast_assign.targets, ast_assign.op, rhs, lineno=0))
 
+        self.current_primary.pop()
         return result
 
     def eval_call(self, ast_call: ast.Call, extra_scope: ExtraScope, primary: PrimaryStatement) -> Union[PseudoTensorValue, EvaluatedValue]:
@@ -305,6 +329,9 @@ class SemiInterpretedAstTransformer:
         
         if not InterpreterHelpers.is_const(callee):
             raise NotImplementedError()
+        
+        if callee.value in self.redirect_funcs:
+            callee.value = self.redirect_funcs[callee.value]
         
         if (callee.value in self.no_eval_funcs):
             kws = [ast.keyword(k, v) for (k,v) in kwargs.items()]
