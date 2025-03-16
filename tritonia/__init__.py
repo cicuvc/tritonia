@@ -434,11 +434,3 @@ def ijit(fn):
     inspect.findsource = origin_findsource
     return parse_locals[tf.func_name]
         
-@ijit
-def add_kernel(x_ptr, y_ptr, N: tl.constexpr):
-    offsets = tl.arange(0, N)
-    x_values = np.array([tl.load(x_ptr + offsets * 4 + i) for i in range(4)]).reshape((2,2))
-    y_values = np.array([tl.load(y_ptr + offsets * 4 + i) for i in range(4)]).reshape((2,2))
-    x_reduced = (y_values @ x_values).flatten()
-
-    [tl.store(x_ptr + offsets * 4 + i, x_reduced[i]) for i in range(4)]
